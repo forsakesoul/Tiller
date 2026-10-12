@@ -18,6 +18,8 @@ protocol TabDelegate: AnyObject {
     func tab(_ tab: Tab, autoResizedTo size: NSSize)
     /// The link under the mouse, or an empty string once it leaves one.
     func tab(_ tab: Tab, statusChanged text: String)
+    /// A page called `window.open`: a new tab, not yet started, for CEF to fill, or nil.
+    func tab(_ tab: Tab, openPopup url: String, background: Bool) -> Tab?
     /// The page asked for the whole screen, as a video player does, or gave it back.
     func tab(_ tab: Tab, fullscreenChanged fullscreen: Bool)
     /// The tab's browser closed to save memory. The tab stays, and loads its
@@ -28,6 +30,7 @@ protocol TabDelegate: AnyObject {
 extension TabDelegate {
     func tab(_ tab: Tab, autoResizedTo size: NSSize) {}
     func tab(_ tab: Tab, statusChanged text: String) {}
+    func tab(_ tab: Tab, openPopup url: String, background: Bool) -> Tab? { nil }
     func tab(_ tab: Tab, fullscreenChanged fullscreen: Bool) {}
     func tabDidUnload(_ tab: Tab) {}
 }
@@ -140,7 +143,23 @@ final class Tab {
         committedURL = url
         self.title = title
         let size = hostView.bounds.size
-        let callbacks = TillerBrowserCallbacks(
+        let callbacks = makeCallbacks()
+        let view = Unmanaged.passUnretained(hostView).toOpaque()
+        let before = Set(hostView.subviews.map(ObjectIdentifier.init))
+        browserID = tiller_browser_create(
+            profile.context, Int32(id), view, Int32(size.width), Int32(size.height), url, callbacks)
+        // CEF adds its view while creating the browser.
+        browserView = hostView.subviews.last { !before.contains(ObjectIdentifier($0)) }
+        let dark = hostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        if dark && !isBlank {
+            let cover = PaintCoverView(frame: hostView.bounds)
+            hostView.addSubview(cover, positioned: .above, relativeTo: nil)
+            paintCover = cover
+        }
+    }
+
+    private func makeCallbacks() -> TillerBrowserCallbacks {
+        return TillerBrowserCallbacks(
             ctx: Unmanaged.passUnretained(self).toOpaque(),
             address_changed: { ctx, url in
                 guard let ctx, let url else { return }
@@ -202,20 +221,47 @@ final class Tab {
             unload_ready: { ctx in
                 guard let ctx else { return }
                 Tab.from(ctx).unloadReady()
+            },
+            popup_tab: { ctx, url, background, tab, size in
+                guard let ctx, let url, let tab, let size else { return nil }
+                let view = Tab.from(ctx).popupTab(
+                    String(cString: url), background: background, callbacks: UInt(bitPattern: tab), size: UInt(bitPattern: size))
+                return UnsafeMutableRawPointer(bitPattern: view)
+            },
+            created: { ctx, id in
+                guard let ctx else { return }
+                Tab.from(ctx).created(id)
             }
         )
-        let view = Unmanaged.passUnretained(hostView).toOpaque()
-        let before = Set(hostView.subviews.map(ObjectIdentifier.init))
-        browserID = tiller_browser_create(
-            profile.context, Int32(id), view, Int32(size.width), Int32(size.height), url, callbacks)
-        // CEF adds its view while creating the browser.
-        browserView = hostView.subviews.last { !before.contains(ObjectIdentifier($0)) }
-        let dark = hostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        if dark && !isBlank {
-            let cover = PaintCoverView(frame: hostView.bounds)
-            hostView.addSubview(cover, positioned: .above, relativeTo: nil)
-            paintCover = cover
+    }
+
+    nonisolated private func popupTab(
+        _ url: String, background: Bool, callbacks: UInt, size: UInt
+    ) -> UInt {
+        MainActor.assumeIsolated {
+            guard let tab = delegate?.tab(self, openPopup: url, background: background) else { return 0 }
+            UnsafeMutablePointer<TillerBrowserCallbacks>(bitPattern: callbacks)?.pointee = tab.makeCallbacks()
+            guard let size = UnsafeMutablePointer<Int32>(bitPattern: size) else { return 0 }
+            size[0] = Int32(tab.hostView.bounds.width)
+            size[1] = Int32(tab.hostView.bounds.height)
+            size[2] = Int32(tab.id)
+            return UInt(bitPattern: Unmanaged.passUnretained(tab.hostView).toOpaque())
         }
+    }
+
+    nonisolated private func created(_ id: Int32) {
+        MainActor.assumeIsolated {
+            browserID = id
+            // CEF added its view to the host view while creating the browser.
+            browserView = hostView.subviews.last
+        }
+    }
+
+    /// Marks a tab whose browser CEF creates itself, for a script's `window.open`.
+    func adoptPopup(url: String) {
+        isStarted = true
+        self.url = url
+        committedURL = url
     }
 
     /// The page being waited for arrived: gives it a moment to paint, then

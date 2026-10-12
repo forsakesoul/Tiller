@@ -37,6 +37,13 @@ typedef struct TillerBrowserCallbacks {
     // An unload passed its checks and beforeunload. Remove the browser's view
     // to finish it; the tab stays.
     void (*unload_ready)(void *ctx);
+    // A page called window.open without window features. Make a tab for it,
+    // fill `tab` with its callbacks and `size` with its view's width and
+    // height, and return its host view; CEF then creates the page inside it.
+    // Return NULL to open `url` through open_tab instead. May be NULL.
+    void *(*popup_tab)(void *ctx, const char *url, bool background, struct TillerBrowserCallbacks *tab, int *size);
+    // The browser behind a popup_tab view exists, with this id. May be NULL.
+    void (*created)(void *ctx, int id);
 } TillerBrowserCallbacks;
 
 // Static version string. Do not free.

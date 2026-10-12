@@ -32,6 +32,8 @@ pub struct Callbacks {
     pub status_changed: Option<unsafe extern "C" fn(*mut c_void, *const c_char)>,
     pub fullscreen_changed: Option<unsafe extern "C" fn(*mut c_void, bool)>,
     pub unload_ready: Option<unsafe extern "C" fn(*mut c_void)>,
+    pub popup_tab: Option<unsafe extern "C" fn(*mut c_void, *const c_char, bool, *mut Callbacks, *mut i32) -> *mut c_void>,
+    pub created: Option<unsafe extern "C" fn(*mut c_void, i32)>,
 }
 
 struct Entry {
@@ -98,6 +100,10 @@ thread_local! {
     /// Native script popups (OAuth windows). CEF owns their windows, but they
     /// must close before CEF shuts down.
     static POPUPS: RefCell<HashMap<i32, Browser>> = RefCell::new(HashMap::new());
+    /// Callbacks of the tab `popup_tab` made for a `window.open` that CEF is
+    /// about to create, taken by `on_after_created`.
+    static PENDING_POPUP: RefCell<Option<Callbacks>> = const { RefCell::new(None) };
+    static PENDING_TAB_ID: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
     static DEVTOOLS_CALLS: RefCell<HashMap<i32, PendingCall>> = RefCell::new(HashMap::new());
 }
 
@@ -944,7 +950,7 @@ wrap_life_span_handler! {
             _user_gesture: i32,
             _popup_features: Option<&PopupFeatures>,
             window_info: Option<&mut WindowInfo>,
-            _client: Option<&mut Option<Client>>,
+            client: Option<&mut Option<Client>>,
             _settings: Option<&mut BrowserSettings>,
             _extra_info: Option<&mut Option<DictionaryValue>>,
             _no_javascript_access: Option<&mut i32>,
@@ -957,13 +963,63 @@ wrap_life_span_handler! {
                 // Let CEF create the popup, preserving opener and request context.
                 return 0;
             }
-            open_in_tab(browser, target_url, target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB);
+            let background = target_disposition == WindowOpenDisposition::NEW_BACKGROUND_TAB;
+            PENDING_POPUP.set(None);
+            // Let CEF create the page in a new tab so `window.open` returns
+            // its window, for pages that navigate it afterwards.
+            let mut browser = browser;
+            let opener = tab_callbacks_for(browser.as_deref_mut());
+            if let Some(info) = window_info && let Some(client) = client
+                && let Some(cb) = opener
+                && let Some(popup_tab) = cb.popup_tab
+            {
+                let url = to_cstring(target_url);
+                // SAFETY: all-zero is a valid Callbacks (null pointers, None).
+                let mut tab: Callbacks = unsafe { std::mem::zeroed() };
+                let mut size = [0i32; 3];
+                let view = unsafe { popup_tab(cb.ctx, url.as_ptr(), background, &mut tab, size.as_mut_ptr()) };
+                if !view.is_null() {
+                    info.parent_view = view;
+                    info.bounds = Rect { x: 0, y: 0, width: size[0], height: size[1] };
+                    PENDING_TAB_ID.set(size[2]);
+                    info.runtime_style = RuntimeStyle::ALLOY;
+                    *client = Some(TillerClient::new());
+                    PENDING_POPUP.set(Some(tab));
+                    return 0;
+                }
+            }
+            open_in_tab(browser, target_url, background);
             1
         }
 
-        /// Tabs register in `create`; only script popups reach here unregistered.
+        /// Tabs register in `create`; script popups reach here unregistered.
         fn on_after_created(&self, browser: Option<&mut Browser>) {
             let Some(browser) = browser else { return };
+            if let Some(callbacks) = PENDING_POPUP.take() {
+                let id = browser.identifier();
+                let opener = browser.host().map(|h| h.opener_identifier()).unwrap_or(0);
+                let context = BROWSERS.with_borrow(|map| {
+                    map.get(&opener).or_else(|| map.values().next()).map(|e| e.context).unwrap_or(0)
+                });
+                BROWSERS.with_borrow_mut(|map| {
+                    map.insert(id, Entry {
+                        browser: browser.clone(),
+                        tab_id: PENDING_TAB_ID.replace(0),
+                        context,
+                        callbacks: Some(callbacks),
+                        devtools: None,
+                        icon_url: None,
+                        icon_origin: String::new(),
+                        closing: false,
+                        unloading: false,
+                        media_access: false,
+                    })
+                });
+                if let Some(f) = callbacks.created {
+                    unsafe { f(callbacks.ctx, id) };
+                }
+                return;
+            }
             if browser.is_popup() != 0 {
                 POPUPS.with_borrow_mut(|map| map.insert(browser.identifier(), browser.clone()));
             }
