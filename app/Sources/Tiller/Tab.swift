@@ -60,6 +60,10 @@ final class Tab {
     /// for its first selection, so a launch with many tabs loads only one page,
     /// and an unloaded tab waits the same way.
     private(set) var isStarted = false
+    /// Waiting for CEF to create the browser of a script's `window.open`. The
+    /// core still calls back into the tab, so closing waits for the browser.
+    private var awaitsPopup = false
+    private var closeWhenCreated = false
     /// CEF's view in `hostView`. Removing it is what destroys the browser.
     private var browserView: NSView?
     /// When the tab was last in front, woken or used by an agent, for
@@ -150,12 +154,16 @@ final class Tab {
             profile.context, Int32(id), view, Int32(size.width), Int32(size.height), url, callbacks)
         // CEF adds its view while creating the browser.
         browserView = hostView.subviews.last { !before.contains(ObjectIdentifier($0)) }
+        coverUntilPainted()
+    }
+
+    /// In dark mode, hides the new browser's white first paint until the page arrives.
+    private func coverUntilPainted() {
         let dark = hostView.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
-        if dark && !isBlank {
-            let cover = PaintCoverView(frame: hostView.bounds)
-            hostView.addSubview(cover, positioned: .above, relativeTo: nil)
-            paintCover = cover
-        }
+        guard dark && !isBlank else { return }
+        let cover = PaintCoverView(frame: hostView.bounds)
+        hostView.addSubview(cover, positioned: .above, relativeTo: nil)
+        paintCover = cover
     }
 
     private func makeCallbacks() -> TillerBrowserCallbacks {
@@ -222,10 +230,11 @@ final class Tab {
                 guard let ctx else { return }
                 Tab.from(ctx).unloadReady()
             },
-            popup_tab: { ctx, url, background, tab, size in
-                guard let ctx, let url, let tab, let size else { return nil }
+            popup_tab: { ctx, url, background, tab, size, tabID in
+                guard let ctx, let url, let tab, let size, let tabID else { return nil }
                 let view = Tab.from(ctx).popupTab(
-                    String(cString: url), background: background, callbacks: UInt(bitPattern: tab), size: UInt(bitPattern: size))
+                    String(cString: url), background: background, callbacks: UInt(bitPattern: tab),
+                    size: UInt(bitPattern: size), tabID: UInt(bitPattern: tabID))
                 return UnsafeMutableRawPointer(bitPattern: view)
             },
             created: { ctx, id in
@@ -236,30 +245,36 @@ final class Tab {
     }
 
     nonisolated private func popupTab(
-        _ url: String, background: Bool, callbacks: UInt, size: UInt
+        _ url: String, background: Bool, callbacks: UInt, size: UInt, tabID: UInt
     ) -> UInt {
         MainActor.assumeIsolated {
-            guard let tab = delegate?.tab(self, openPopup: url, background: background) else { return 0 }
-            UnsafeMutablePointer<TillerBrowserCallbacks>(bitPattern: callbacks)?.pointee = tab.makeCallbacks()
-            guard let size = UnsafeMutablePointer<Int32>(bitPattern: size) else { return 0 }
+            guard let callbacks = UnsafeMutablePointer<TillerBrowserCallbacks>(bitPattern: callbacks),
+                  let size = UnsafeMutablePointer<Int32>(bitPattern: size),
+                  let tabID = UnsafeMutablePointer<Int32>(bitPattern: tabID),
+                  let tab = delegate?.tab(self, openPopup: url, background: background)
+            else { return 0 }
+            callbacks.pointee = tab.makeCallbacks()
             size[0] = Int32(tab.hostView.bounds.width)
             size[1] = Int32(tab.hostView.bounds.height)
-            size[2] = Int32(tab.id)
+            tabID.pointee = Int32(tab.id)
             return UInt(bitPattern: Unmanaged.passUnretained(tab.hostView).toOpaque())
         }
     }
 
     nonisolated private func created(_ id: Int32) {
         MainActor.assumeIsolated {
+            awaitsPopup = false
             browserID = id
             // CEF added its view to the host view while creating the browser.
             browserView = hostView.subviews.last
+            if closeWhenCreated { tiller_browser_close(id) } else { coverUntilPainted() }
         }
     }
 
     /// Marks a tab whose browser CEF creates itself, for a script's `window.open`.
     func adoptPopup(url: String) {
         isStarted = true
+        awaitsPopup = true
         self.url = url
         committedURL = url
     }
@@ -359,7 +374,9 @@ final class Tab {
 
     /// Runs beforeunload, then calls `tabReadyToClose` unless the page cancels.
     func close() {
-        if browserID < 0 {
+        if awaitsPopup {
+            closeWhenCreated = true
+        } else if browserID < 0 {
             delegate?.tabReadyToClose(self)
         } else {
             tiller_browser_close(browserID)
